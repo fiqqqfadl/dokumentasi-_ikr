@@ -14,8 +14,6 @@ from telegram.ext import (
 from telegram.request import HTTPXRequest
 from telegram.error import TimedOut, NetworkError, RetryAfter
 
-from keep_alive import keep_alive
-
 # ================== CONFIG ==================
 load_dotenv()
 BOT_TOKEN    = os.getenv("BOT_TOKEN")
