@@ -1,7 +1,4 @@
-import os, re, io, time, base64, unicodedata
-import datetime as dt
-import asyncio
-import requests
+import os, re, io, time, base64, unicodedata, asyncio, datetime as dt, requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
@@ -11,25 +8,28 @@ from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler,
     ContextTypes, CallbackContext, filters
 )
-from telegram.request import HTTPXRequest
 from telegram.error import TimedOut, NetworkError, RetryAfter
+from telegram.request import HTTPXRequest
 
 # ================== CONFIG ==================
 load_dotenv()
-BOT_TOKEN    = os.getenv("BOT_TOKEN")
-SHEETDB_URL  = os.getenv("SHEETDB_URL")
-GAS_URL      = os.getenv("GAS_URL")      # Apps Script Web App (/exec)
-GAS_KEY      = os.getenv("GAS_KEY")      # KEY yg sama dgn di Apps Script
-ALBUM_WAIT   = 2.0                       # detik debounce album
-HTTP_TIMEOUT = 240                       # timeout untuk GET/POST besar
-SLEEP_BETWEEN = 0.4                      # jeda kecil antar upload
+BOT_TOKEN      = os.getenv("BOT_TOKEN")
+SHEETDB_URL    = os.getenv("SHEETDB_URL")
+GAS_URL        = os.getenv("GAS_URL")
+GAS_KEY        = os.getenv("GAS_KEY")
+WEBHOOK_URL    = os.getenv("WEBHOOK_URL")       # e.g. https://xxx.up.railway.app/tg/abc123
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")# optional, tapi disarankan
+PORT           = int(os.getenv("PORT", "8080")) # port server untuk webhook
+
+ALBUM_WAIT     = 2.0
+HTTP_TIMEOUT   = 240
+SLEEP_BETWEEN  = 0.4
 # ============================================
 
 # ---------- HTTP session global (retry/backoff) ----------
 session = requests.Session()
 retries = Retry(
-    total=5,
-    backoff_factor=0.8,
+    total=5, backoff_factor=0.8,
     status_forcelist=[429, 500, 502, 503, 504],
     allowed_methods=frozenset(["GET", "POST"])
 )
@@ -68,8 +68,7 @@ def parse_message(text: str):
         lines = []
         for line in data["teknisi"].splitlines():
             line = re.sub(r"^\s*\d+[\.\)]\s*", "", line.strip())
-            if line:
-                lines.append(line)
+            if line: lines.append(line)
         data["teknisi"] = ", ".join(lines)
     return data
 
@@ -96,18 +95,17 @@ def save_to_sheetdb(data: dict, from_user: str, photo_urls: list[str]):
     r = session.post(SHEETDB_URL, json={"data": [row]}, timeout=HTTP_TIMEOUT)
     return r.status_code, r.text
 
-# ---------- Apps Script uploader (tanpa kompres) ----------
+# ---------- Apps Script uploader ----------
 def upload_to_gas_retry(raw: bytes, filename: str, mime: str = "image/jpeg", cust: str | None = None) -> str:
     if not GAS_URL or not GAS_KEY:
-        raise RuntimeError("GAS_URL / GAS_KEY belum diset di Secrets Replit.")
+        raise RuntimeError("GAS_URL / GAS_KEY belum diset.")
     payload = {
         "key": GAS_KEY,
         "name": filename,
         "mime": mime,
         "file": base64.b64encode(raw).decode("ascii"),
     }
-    if cust:
-        payload["cust"] = cust
+    if cust: payload["cust"] = cust
     last_err = None
     for attempt in range(1, 5):
         try:
@@ -136,7 +134,7 @@ async def get_tg_bytes(bot, file_id: str) -> bytes:
             await asyncio.sleep(0.8 * attempt)
     raise last
 
-# ---------- Album manager ----------
+# ---------- Album manager (pakai JobQueue) ----------
 class AlbumState:
     __slots__ = ("file_ids", "captions", "chat_id", "user", "finalized")
     def __init__(self, chat_id: int, user: str):
@@ -148,7 +146,6 @@ class AlbumState:
 
 album_cache: dict[str, AlbumState] = {}
 
-# ---------- Helper kirim pesan dengan retry ----------
 async def safe_send(context: CallbackContext, chat_id: int, text: str, tries: int = 4):
     delay = 1.5
     for _ in range(tries):
@@ -160,15 +157,12 @@ async def safe_send(context: CallbackContext, chat_id: int, text: str, tries: in
         except (TimedOut, NetworkError):
             await asyncio.sleep(delay); delay *= 1.7
         except Exception as e:
-            print("[safe_send] fatal:", e)
-            break
+            print("[safe_send] fatal:", e); break
 
-# ---------- Job: finalize album ----------
 async def finalize_album_job(context: CallbackContext):
     mgid = context.job.name
     state = album_cache.get(mgid)
-    if not state or state.finalized:
-        return
+    if not state or state.finalized: return
     state.finalized = True
 
     caption = next((c for c in state.captions if c), "")
@@ -210,25 +204,22 @@ def get_text(update: Update) -> str:
     return update.message.caption if update.message and update.message.caption else (update.message.text or "")
 
 async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message:
-        return
+    if not update.message: return
 
     text = get_text(update)
     user = f"{update.effective_user.full_name} (@{update.effective_user.username or ''})"
     chat_id = update.effective_chat.id
 
-    # ====== DOKUMEN (gambar asli/HD) ======
+    # ---- Dokumen (gambar asli) ----
     if update.message.document:
         doc = update.message.document
         mime = (doc.mime_type or "").lower()
         if mime.startswith("image/"):
             data = parse_message(text)
             cust = sanitize_filename(data.get("cust_name") or "Photo")
-
             if doc.file_size and doc.file_size > 45 * 1024 * 1024:
-                await update.message.reply_text("⚠️ File >45MB. Bagi jadi beberapa dokumen (batas Apps Script ~50MB).")
+                await update.message.reply_text("⚠️ File >45MB. Bagi jadi beberapa dokumen.")
                 return
-
             try:
                 raw = await get_tg_bytes(context.bot, doc.file_id)
                 ext = os.path.splitext(doc.file_name or "")[1] or ".jpg"
@@ -241,31 +232,27 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await update.message.reply_text(f"⚠️ Gagal simpan ke Sheet:\n{resp_text}")
             except Exception as e:
                 await update.message.reply_text(f"⚠️ Gagal upload dokumen: {e}")
-            return
+        return
 
-    # ====== FOTO ======
+    # ---- Foto ----
     if update.message.photo:
         file_id = update.message.photo[-1].file_id
         mgid = update.message.media_group_id
 
-        if mgid:
-            st = album_cache.get(mgid)
-            if not st:
-                st = AlbumState(chat_id=chat_id, user=user)
-                album_cache[mgid] = st
+        if mgid:  # album
+            st = album_cache.get(mgid) or AlbumState(chat_id, user)
+            album_cache[mgid] = st
             st.file_ids.append(file_id)
             st.captions.append(text)
 
+            # debounce finalize album via JobQueue
             jq = context.job_queue
-            if jq:
-                for job in jq.get_jobs_by_name(mgid):
-                    job.schedule_removal()
-                jq.run_once(finalize_album_job, when=ALBUM_WAIT, name=mgid)
-            else:
-                await update.message.reply_text("⚠️ JobQueue belum aktif. Instal: python-telegram-bot[job-queue]==20.8")
+            for job in jq.get_jobs_by_name(mgid):
+                job.schedule_removal()
+            jq.run_once(finalize_album_job, when=ALBUM_WAIT, name=mgid)
             return
 
-        # ---- single photo ----
+        # single photo
         data = parse_message(text)
         cust = sanitize_filename(data.get("cust_name") or "Photo")
         try:
@@ -286,45 +273,33 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"⚠️ Gagal upload: {e}")
         return
 
-    # ====== TEKS SAJA ======
+    # ---- Teks saja ----
     data = parse_message(text)
     code, resp_text = save_to_sheetdb(data, user, [])
     if code in (200, 201):
-        await update.message.reply_text(
-            f"✅ Data tersimpan ke Spreadsheet.\nCust: {data['cust_name']} | CID: {data['cid']}\nFoto: 0"
-        )
+        await update.message.reply_text(f"✅ Data tersimpan ke Spreadsheet.\nCust: {data['cust_name']} | CID: {data['cid']}\nFoto: 0")
     else:
         await update.message.reply_text(f"⚠️ Gagal simpan:\n{resp_text}")
 
-# ---------- Heartbeat (self-ping) ----------
-async def heartbeat(context: CallbackContext):
-    if not PUBLIC_URL:
-        return
-    try:
-        await asyncio.to_thread(lambda: session.get(PUBLIC_URL, timeout=10))
-    except Exception:
-        pass
-
-def run_bot():
-    req = HTTPXRequest(  # timeout longgar untuk API Telegram
-        connect_timeout=30.0, read_timeout=90.0, write_timeout=90.0, pool_timeout=30.0
-    )
+# ---------- MAIN (WEBHOOK) ----------
+def main():
+    # HTTPXRequest supaya timeout agak longgar
+    req = HTTPXRequest(connect_timeout=30.0, read_timeout=90.0, write_timeout=90.0, pool_timeout=30.0)
     app = ApplicationBuilder().token(BOT_TOKEN).request(req).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT | filters.PHOTO | filters.Document.ALL, handle))
 
-    if app.job_queue:
-        app.job_queue.run_repeating(heartbeat, interval=120, first=5)
-    else:
-        print("[warn] JobQueue not available → heartbeat dimatikan")
-
-    async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
-        print("[error]", repr(context.error))
-    app.add_error_handler(on_error)
-
-    print("[bot] starting polling…")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    # Set webhook & jalankan server aiohttp internal PTB
+    # WEBHOOK_URL contoh: https://xxx.up.railway.app/tg/abc123
+    print("[webhook] set to:", WEBHOOK_URL)
+    app.run_webhook(
+        listen="0.0.0.0",
+        port=PORT,
+        secret_token=WEBHOOK_SECRET or None,
+        url_path=WEBHOOK_URL.split("/", 3)[-1],   # path setelah domain
+        webhook_url=WEBHOOK_URL
+    )
 
 if __name__ == "__main__":
-    run_bot()
+    main()
